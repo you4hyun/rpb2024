@@ -1,0 +1,167 @@
+import os
+import sys
+import traci
+import random
+from collections import defaultdict
+import math
+
+class DRTRequest:
+    def __init__(self, passenger_id, pickup_edge, dropoff_edge, request_time):
+        self.passenger_id = passenger_id
+        self.pickup_edge = pickup_edge
+        self.dropoff_edge = dropoff_edge
+        self.request_time = request_time
+        self.status = "REQUESTED"
+
+class DRTVehicle:
+    def __init__(self, vehicle_id, capacity=4):
+        self.vehicle_id = vehicle_id
+        self.capacity = capacity
+        self.passengers = []
+        self.assigned_requests = []
+        self.status = "IDLE"
+
+class DRTSimulation:
+    def __init__(self):
+        self.vehicles = {}
+        self.requests = {}
+        self.current_step = 0
+        self.pending_requests = []
+        
+    def initialize_vehicles(self, num_vehicles):
+        available_edges = traci.edge.getIDList()
+        valid_edges = [edge for edge in available_edges if not edge.startswith(':')]
+        
+        for i in range(num_vehicles):
+            vehicle_id = f"drt_{i}"
+            start_edge = random.choice(valid_edges)
+            try:
+                # 차량 생성 및 초기 위치 설정
+                traci.vehicle.add(vehicle_id, "drt_route", typeID="drt_vehicle", departLane="best")
+                traci.vehicle.setRoute(vehicle_id, [start_edge])
+                self.vehicles[vehicle_id] = DRTVehicle(vehicle_id)
+                print(f"차량 {vehicle_id} 생성됨 - 시작 위치: {start_edge}")
+            except traci.exceptions.TraCIException as e:
+                print(f"차량 {vehicle_id} 초기화 실패: {e}")
+
+    def generate_random_request(self):
+        if random.random() < 0.05:  # 5% 확률로 요청 생성
+            available_edges = [edge for edge in traci.edge.getIDList() if not edge.startswith(':')]
+            if len(available_edges) < 2:
+                return
+            
+            pickup_edge = random.choice(available_edges)
+            dropoff_edge = random.choice([e for e in available_edges if e != pickup_edge])
+            
+            passenger_id = f"passenger_{len(self.requests)}"
+            request = DRTRequest(passenger_id, pickup_edge, dropoff_edge, self.current_step)
+            self.requests[passenger_id] = request
+            self.pending_requests.append(request)
+            print(f"\n새로운 요청: {passenger_id}")
+            print(f"출발지: {pickup_edge}")
+            print(f"목적지: {dropoff_edge}")
+
+    def get_vehicle_position(self, vehicle_id):
+        try:
+            return traci.vehicle.getRoadID(vehicle_id)
+        except:
+            return None
+
+    def calculate_route(self, from_edge, to_edge):
+        try:
+            route = traci.simulation.findRoute(from_edge, to_edge)
+            if route.edges:
+                return route.edges
+        except:
+            pass
+        return None
+
+    def assign_requests(self):
+        for request in self.pending_requests[:]:
+            # 가장 가까운 빈 차량 찾기
+            min_distance = float('inf')
+            best_vehicle = None
+            
+            for vehicle in self.vehicles.values():
+                if len(vehicle.passengers) >= vehicle.capacity:
+                    continue
+                    
+                current_pos = self.get_vehicle_position(vehicle.vehicle_id)
+                if not current_pos or current_pos.startswith(':'):
+                    continue
+                
+                try:
+                    route = traci.simulation.findRoute(current_pos, request.pickup_edge)
+                    if route.length < min_distance:
+                        min_distance = route.length
+                        best_vehicle = vehicle
+                except:
+                    continue
+            
+            if best_vehicle:
+                print(f"\n차량 {best_vehicle.vehicle_id}가 요청 {request.passenger_id}를 수락")
+                request.status = "ASSIGNED"
+                best_vehicle.assigned_requests.append(request)
+                self.pending_requests.remove(request)
+                
+                # 차량에 새로운 경로 설정
+                current_pos = self.get_vehicle_position(best_vehicle.vehicle_id)
+                route = self.calculate_route(current_pos, request.pickup_edge)
+                if route:
+                    traci.vehicle.setRoute(best_vehicle.vehicle_id, route)
+                    print(f"차량 {best_vehicle.vehicle_id}가 승객 {request.passenger_id}를 픽업하러 이동 중")
+
+    def update_vehicles(self):
+        for vehicle in self.vehicles.values():
+            if not vehicle.assigned_requests:
+                continue
+                
+            current_pos = self.get_vehicle_position(vehicle.vehicle_id)
+            if not current_pos or current_pos.startswith(':'):
+                continue
+                
+            request = vehicle.assigned_requests[0]
+            
+            if request.status == "ASSIGNED" and current_pos == request.pickup_edge:
+                print(f"\n차량 {vehicle.vehicle_id}가 승객 {request.passenger_id}를 픽업")
+                request.status = "PICKED_UP"
+                vehicle.passengers.append(request.passenger_id)
+                
+                # 목적지로 경로 설정
+                route = self.calculate_route(current_pos, request.dropoff_edge)
+                if route:
+                    traci.vehicle.setRoute(vehicle.vehicle_id, route)
+                    print(f"차량 {vehicle.vehicle_id}가 목적지로 이동 중")
+                    
+            elif request.status == "PICKED_UP" and current_pos == request.dropoff_edge:
+                print(f"\n차량 {vehicle.vehicle_id}가 승객 {request.passenger_id}를 하차")
+                vehicle.passengers.remove(request.passenger_id)
+                vehicle.assigned_requests.pop(0)
+                request.status = "COMPLETED"
+
+    def run(self):
+        try:
+            traci.start(["sumo-gui", "-c", "simulation.sumocfg"])
+            self.initialize_vehicles(3)  # 3대의 차량으로 시작
+            print("\n시뮬레이션 시작")
+            
+            while traci.simulation.getMinExpectedNumber() > 0:
+                self.current_step = traci.simulation.getTime()
+                
+                if self.current_step % 100 == 0:
+                    print(f"\n현재 시뮬레이션 시간: {self.current_step}")
+                
+                self.generate_random_request()
+                self.assign_requests()
+                self.update_vehicles()
+                
+                traci.simulationStep()
+                
+        except Exception as e:
+            print(f"시뮬레이션 오류: {e}")
+        finally:
+            traci.close()
+
+if __name__ == "__main__":
+    simulation = DRTSimulation()
+    simulation.run()
