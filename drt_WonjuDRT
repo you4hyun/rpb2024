@@ -1,0 +1,423 @@
+import os
+import sys
+import traci
+import random
+from datetime import datetime, time
+
+if 'SUMO_HOME' in os.environ:
+    tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
+    sys.path.append(tools)
+else:
+    sys.exit("SUMO_HOME 환경변수를 설정해주세요.")
+
+class WonjuBusStop:
+    def __init__(self, stop_id, name, edge_id, is_depot=False):
+        self.id = stop_id
+        self.name = name
+        self.edge_id = edge_id
+        self.is_depot = is_depot
+        self.is_transfer_point = False  # 환승 지점 여부
+
+class WonjuDRTVehicle:
+    def __init__(self, vehicle_id, service_area):
+        self.id = vehicle_id
+        self.service_area = service_area  # 서비스 권역 (예: "부론면", "흥업면" 등)
+        self.status = "IDLE"
+        self.capacity = 15  # 원주 부름버스 기준
+        self.current_occupancy = 0
+        self.scheduled_stops = []
+        self.last_edge = None
+        self.active = True
+        self.operation_start = time(6, 0)  # 운행 시작 시간 (06:00)
+        self.operation_end = time(22, 0)   # 운행 종료 시간 (22:00)
+        self.break_time = []  # 휴식 시간대 설정
+
+    def can_accept_passengers(self, num_passengers):
+        return self.current_occupancy + num_passengers <= self.capacity
+
+    def is_operating_hours(self, current_time):
+        time_obj = datetime.fromtimestamp(current_time).time()
+        return self.operation_start <= time_obj <= self.operation_end
+
+class WonjuDRTRequest:
+    def __init__(self, request_id, origin, destination, num_passengers):
+        self.id = request_id
+        self.origin = origin
+        self.destination = destination
+        self.num_passengers = num_passengers
+        self.status = "WAITING"
+        self.request_time = None
+        self.pickup_time = None
+        self.dropoff_time = None
+        self.assigned_vehicle = None
+        self.service_area = None  # 요청 지역 (예: "부론면")
+        self.is_reserved = False  # 사전 예약 여부
+        self.reservation_time = None  # 예약 시간
+        self.fare = 1500  # 기본 요금 (원주 부름버스 기준)
+
+class WonjuDRTMetrics:
+    def __init__(self):
+        self.total_requests = 0
+        self.completed_requests = 0
+        self.rejected_requests = 0
+        self.total_wait_time = 0
+        self.total_travel_time = 0
+        self.total_distance = 0
+        self.total_revenue = 0
+        self.area_stats = {}  # 권역별 통계
+        self.time_stats = {}  # 시간대별 통계
+
+    def calculate_metrics(self):
+        return {
+            "서비스 통계": {
+                "총 요청 건수": self.total_requests,
+                "완료된 요청": self.completed_requests,
+                "거절된 요청": self.rejected_requests,
+                "평균 대기 시간 (분)": self.total_wait_time / max(self.completed_requests, 1) / 60,
+                "평균 이동 시간 (분)": self.total_travel_time / max(self.completed_requests, 1) / 60
+            },
+            "권역별 통계": self.area_stats,
+            "시간대별 통계": self.time_stats,
+            "수익성 지표": {
+                "총 수익": self.total_revenue,
+                "요청당 평균 수익": self.total_revenue / max(self.completed_requests, 1)
+            }
+        }
+
+class WonjuDRTSystem:
+    def __init__(self):
+        self.vehicles = {}
+        self.requests = {}
+        self.stops = self.initialize_stops()
+        self.service_areas = self.initialize_service_areas()
+        self.metrics = WonjuDRTMetrics()
+        self.current_time = None
+
+    def initialize_stops(self):
+        # 원주시 부름버스 정류장 정보
+        stops = {
+            # 부론면 정류장
+            "buron_1": WonjuBusStop("buron_1", "부론면사무소", "-1006685487", True),
+            "buron_2": WonjuBusStop("buron_2", "부론면버스정류장", "-1006685488"),
+            
+            # 흥업면 정류장
+            "heungeup_1": WonjuBusStop("heungeup_1", "흥업면사무소", "-1013458887", True),
+            
+            # 문막읍 정류장
+            "munmak_1": WonjuBusStop("munmak_1", "문막읍사무소", "-1010175240"),
+            
+            # 호저면 정류장
+            "hojeo_1": WonjuBusStop("hojeo_1", "호저면사무소", "-1021870413")
+        }
+        return stops
+
+    def initialize_service_areas(self):
+        # 원주시 부름버스 서비스 권역 설정
+        areas = {
+            "부론면": {
+                "depot": self.stops["buron_1"],
+                "stops": [self.stops["buron_1"], self.stops["buron_2"]],
+                "vehicles": 2  # 배치 차량 수
+            },
+            "흥업면": {
+                "depot": self.stops["heungeup_1"],
+                "stops": [self.stops["heungeup_1"]],
+                "vehicles": 1
+            }
+        }
+        return areas
+
+    def add_vehicle(self, vehicle_id, service_area):
+        try:
+            if service_area not in self.service_areas:
+                raise ValueError(f"Invalid service area: {service_area}")
+
+            depot = self.service_areas[service_area]["depot"]
+            
+            if self.check_vehicle_existence(vehicle_id):
+                traci.vehicle.remove(vehicle_id)
+            
+            traci.vehicle.add(vehicle_id, "route_0", typeID="drt_vehicle")
+            traci.vehicle.setStop(vehicle_id, depot.edge_id, duration=1)
+            traci.vehicle.setColor(vehicle_id, (255, 255, 255))
+            
+            vehicle = WonjuDRTVehicle(vehicle_id, service_area)
+            vehicle.last_edge = depot.edge_id
+            self.vehicles[vehicle_id] = vehicle
+            
+            print(f"차량 {vehicle_id} 추가됨 ({service_area} 담당)")
+            
+        except traci.exceptions.TraCIException as e:
+            print(f"차량 추가 실패: {e}")
+
+    def process_request(self, origin_stop_id, destination_stop_id, num_passengers=1, is_reserved=False):
+        if origin_stop_id not in self.stops or destination_stop_id not in self.stops:
+            print("잘못된 정류장 ID입니다.")
+            return None
+
+        origin = self.stops[origin_stop_id]
+        destination = self.stops[destination_stop_id]
+
+        # 서비스 권역 확인
+        service_area = None
+        for area_name, area_info in self.service_areas.items():
+            if origin in area_info["stops"]:
+                service_area = area_name
+                break
+
+        if not service_area:
+            print("서비스 불가 지역입니다.")
+            return None
+
+        request_id = f"req_{len(self.requests)}"
+        request = WonjuDRTRequest(request_id, origin.edge_id, destination.edge_id, num_passengers)
+        request.service_area = service_area
+        request.is_reserved = is_reserved
+        request.request_time = self.current_time
+
+        # 요금 계산 (거리 기반)
+        try:
+            route = traci.simulation.findRoute(origin.edge_id, destination.edge_id)
+            distance = route.length
+            request.fare = self.calculate_fare(distance)
+        except:
+            request.fare = 1500  # 기본 요금
+
+        self.requests[request_id] = request
+        self.find_available_vehicle(request_id)
+        return request_id
+
+    def calculate_fare(self, distance):
+        # 원주 부름버스 요금 체계
+        base_fare = 1500  # 기본 요금
+        distance_fare = max(0, (distance - 10000) // 1000) * 100  # 10km 초과시 1km당 100원
+        return base_fare + distance_fare
+
+    def find_available_vehicle(self, request_id):
+        request = self.requests[request_id]
+        service_area = request.service_area
+        available_vehicles = []
+
+        # 해당 서비스 권역의 차량만 검색
+        for vehicle_id, vehicle in self.vehicles.items():
+            if vehicle.service_area != service_area or not vehicle.active:
+                continue
+
+            if vehicle.can_accept_passengers(request.num_passengers):
+                try:
+                    current_edge = traci.vehicle.getRoadID(vehicle_id)
+                    if current_edge == '':
+                        current_edge = vehicle.last_edge
+
+                    if vehicle.status == "IDLE":
+                        route = traci.simulation.findRoute(current_edge, request.origin)
+                        if route.edges:
+                            available_vehicles.append((vehicle_id, route.length))
+
+                except traci.exceptions.TraCIException:
+                    continue
+
+        if not available_vehicles:
+            print(f"요청 {request_id}: 현재 가용 차량이 없습니다.")
+            self.metrics.rejected_requests += 1
+            return None
+
+        # 가장 가까운 차량 선택
+        best_vehicle_id = min(available_vehicles, key=lambda x: x[1])[0]
+        
+        if self.assign_request_to_vehicle(best_vehicle_id, request_id):
+            print(f"요청 {request_id}가 차량 {best_vehicle_id}에 배정되었습니다.")
+            return best_vehicle_id
+
+        return None
+
+    def update(self):
+        self.current_time = traci.simulation.getTime()
+        
+        # 차량 상태 업데이트
+        for vehicle_id, vehicle in self.vehicles.items():
+            if not vehicle.active or not vehicle.is_operating_hours(self.current_time):
+                continue
+
+            try:
+                current_edge = traci.vehicle.getRoadID(vehicle_id)
+                if current_edge != '':
+                    vehicle.last_edge = current_edge
+
+                # 정류장 도착 처리
+                if vehicle.scheduled_stops:
+                    stop_info = vehicle.scheduled_stops[0]
+                    if current_edge == stop_info["edge_id"]:
+                        self.handle_stop_arrival(vehicle_id, stop_info)
+                        vehicle.scheduled_stops.pop(0)
+
+            except traci.exceptions.TraCIException as e:
+                print(f"차량 업데이트 오류: {e}")
+
+        # 통계 업데이트
+        self.update_metrics()
+
+    def handle_stop_arrival(self, vehicle_id, stop_info):
+        vehicle = self.vehicles[vehicle_id]
+        action = stop_info["action"]
+        request_id = stop_info["request_id"]
+        request = self.requests[request_id]
+
+        if action == "PICKUP":
+            vehicle.current_occupancy += request.num_passengers
+            request.status = "ONBOARD"
+            request.pickup_time = self.current_time
+            self.metrics.total_revenue += request.fare
+            print(f"차량 {vehicle_id}: {request.num_passengers}명 승차 (현재 {vehicle.current_occupancy}명)")
+
+        elif action == "DROPOFF":
+            vehicle.current_occupancy -= request.num_passengers
+            request.status = "COMPLETED"
+            request.dropoff_time = self.current_time
+            self.metrics.completed_requests += 1
+            print(f"차량 {vehicle_id}: {request.num_passengers}명 하차 (현재 {vehicle.current_occupancy}명)")
+
+    def update_metrics(self):
+        # 실시간 통계 업데이트
+        for request in self.requests.values():
+            if request.status == "COMPLETED":
+                area = request.service_area
+                if area not in self.metrics.area_stats:
+                    self.metrics.area_stats[area] = {
+                        "완료된 요청": 0,
+                        "총 수익": 0
+                    }
+                self.metrics.area_stats[area]["완료된 요청"] += 1
+                self.metrics.area_stats[area]["총 수익"] += request.fare
+
+def run_wonju_simulation():
+    sumo_binary = "sumo-gui"
+    sumo_cmd = [sumo_binary, "-c", "config/wonju.sumocfg"]
+
+    try:
+        traci.start(sumo_cmd)
+        print("원주시 부름버스 시뮬레이션 시작")
+
+        drt_system = WonjuDRTSystem()
+
+        # 권역별 차량 배치
+        for area_name, area_info in drt_system.service_areas.items():
+            for i in range(area_info["vehicles"]):
+                drt_system.add_vehicle(f"bus_{area_name}_{i}", area_name)
+
+        step = 0
+        next_request_time = random.randint(100, 300)
+        
+        # 시간대별 수요 가중치 (06:00 ~ 22:00)
+        time_weights = {
+            6: 0.5,   # 이른 아침
+            7: 1.0,   # 출근 시간
+            8: 1.2,
+            9: 0.8,
+            10: 0.6,  # 오전
+            11: 0.7,
+            12: 0.9,  # 점심 시간
+            13: 0.8,
+            14: 0.6,  # 오후
+            15: 0.7,
+            16: 1.0,  # 퇴근 시간
+            17: 1.2,
+            18: 1.0,
+            19: 0.8,  # 저녁
+            20: 0.6,
+            21: 0.4   # 늦은 저녁
+        }
+
+        while step < 3600 * 16:  # 16시간 운영 (06:00 ~ 22:00)
+            traci.simulationStep()
+            current_hour = 6 + (step // 3600)  # 현재 시간 계산
+            
+            if step >= next_request_time:
+                # 시간대별 수요에 따른 요청 생성 확률 조정
+                if current_hour in time_weights and random.random() < time_weights[current_hour]:
+                    # 무작위 정류장 선택
+                    all_stops = list(drt_system.stops.keys())
+                    origin = random.choice(all_stops)
+                    destination = random.choice([s for s in all_stops if s != origin])
+                    
+                    # 요청 생성
+                    passengers = random.randint(1, 4)
+                    request_id = drt_system.process_request(origin, destination, passengers)
+                    
+                    if request_id:
+                        print(f"\n시간: {current_hour:02d}:00, 새로운 요청 - {origin}에서 {destination}까지 {passengers}명")
+                
+                # 다음 요청 시간 설정 (시간대별 수요에 따라 간격 조정)
+                base_interval = random.randint(200, 500)
+                demand_factor = time_weights.get(current_hour, 0.5)
+                next_request_time = step + int(base_interval / demand_factor)
+
+            # 시스템 업데이트
+            drt_system.update()
+            
+            # 매 시간마다 통계 출력
+            if step % 3600 == 0 and step > 0:
+                print(f"\n=== {current_hour:02d}:00 운영 현황 ===")
+                stats = drt_system.get_hourly_statistics(current_hour)
+                print_statistics(stats)
+
+            step += 1
+
+        # 최종 통계 출력
+        print("\n=== 시뮬레이션 최종 결과 ===")
+        final_stats = drt_system.get_final_statistics()
+        print_detailed_statistics(final_stats)
+
+        traci.close()
+        print("\n시뮬레이션 완료")
+
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        if 'traci' in sys.modules:
+            traci.close()
+
+def print_statistics(stats):
+    """시간별 통계 출력 함수"""
+    print(f"처리된 요청: {stats['completed_requests']}건")
+    print(f"대기 중인 요청: {stats['waiting_requests']}건")
+    print(f"평균 대기 시간: {stats['avg_wait_time']:.1f}분")
+    print(f"차량 가동률: {stats['vehicle_utilization']:.1f}%")
+
+def print_detailed_statistics(stats):
+    """상세 통계 출력 함수"""
+    print("\n1. 서비스 운영 실적")
+    print(f"총 요청 건수: {stats['total_requests']}건")
+    print(f"완료된 요청: {stats['completed_requests']}건")
+    print(f"거절된 요청: {stats['rejected_requests']}건")
+    print(f"평균 대기 시간: {stats['avg_wait_time']:.1f}분")
+    print(f"평균 이동 시간: {stats['avg_travel_time']:.1f}분")
+
+    print("\n2. 권역별 통계")
+    for area, area_stats in stats['area_stats'].items():
+        print(f"\n{area}:")
+        print(f"  처리된 요청: {area_stats['completed_requests']}건")
+        print(f"  총 수익: {area_stats['total_revenue']:,}원")
+        print(f"  평균 탑승률: {area_stats['avg_occupancy']:.1f}%")
+
+    print("\n3. 시간대별 통계")
+    for hour, hour_stats in stats['time_stats'].items():
+        print(f"\n{hour:02d}:00 ~ {hour+1:02d}:00")
+        print(f"  요청 건수: {hour_stats['requests']}건")
+        print(f"  평균 대기 시간: {hour_stats['avg_wait_time']:.1f}분")
+
+    print("\n4. 차량 운영 현황")
+    print(f"총 운행 거리: {stats['total_distance']:.1f}km")
+    print(f"평균 차량 가동률: {stats['avg_vehicle_utilization']:.1f}%")
+    print(f"총 운행 수익: {stats['total_revenue']:,}원")
+    print(f"km당 운영 비용: {stats['cost_per_km']:,}원")
+
+def main():
+    # 환경 변수 확인
+    if 'SUMO_HOME' not in os.environ:
+        sys.exit("SUMO_HOME 환경변수를 설정해주세요.")
+
+    # 시뮬레이션 실행
+    run_wonju_simulation()
+
+if __name__ == "__main__":
+    main()
