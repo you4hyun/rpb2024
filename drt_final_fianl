@@ -334,6 +334,12 @@ class DRTSystem:
             "효과성 분석": metrics
         }
 
+def generate_passenger_request():
+    # 출발지와 목적지 정의
+    origins = ["-1006685487", "-1013458887"]  # 부론면, 흥원면
+    destinations = ["-1010175240", "-1060515905", "-1021870413"]  # 문막읍, 소초면, 호저면
+    return random.choice(origins), random.choice(destinations)
+
 def run_simulation():
     sumo_binary = "sumo-gui"
     sumo_cmd = [sumo_binary, "-c", "config/wonju.sumocfg"]
@@ -344,25 +350,51 @@ def run_simulation():
 
         drt_system = DRTSystem()
 
+        # 2대의 차량 추가
         for i in range(2):
             drt_system.add_vehicle(f"drt_{i}")
 
         step = 0
-        while step < 3600:
+        next_request_time = random.randint(100, 300)  # 첫 요청 시간 (100~300초 사이)
+
+        while step < 3600:  # 1시간 시뮬레이션
             traci.simulationStep()
+            
+            # 새로운 승객 요청 생성
+            if step >= next_request_time:
+                print(f"\n시뮬레이션 시간: {step}초")
+                origin, destination = generate_passenger_request()
+                request_id = drt_system.add_request(origin, destination)
+                print(f"새로운 승객 요청: {origin} -> {destination}")
+                
+                # 다음 요청 시간 설정 (100~300초 간격)
+                next_request_time = step + random.randint(100, 300)
+
             drt_system.update_vehicles()
             step += 1
 
-        detailed_stats = drt_system.get_detailed_statistics()
-
         print("\n=== 시뮬레이션 결과 ===")
+        detailed_stats = drt_system.get_detailed_statistics()
+        
         for category, values in detailed_stats.items():
-            print(f"{category}:")
-            for key, value in values.items():
-                print(f"  {key}: {value}")
+            print(f"\n{category}:")
+            if isinstance(values, dict):
+                for key, value in values.items():
+                    if isinstance(value, dict):
+                        print(f"  {key}:")
+                        for subkey, subvalue in value.items():
+                            if isinstance(subvalue, float):
+                                print(f"    {subkey}: {subvalue:.2f}")
+                            else:
+                                print(f"    {subkey}: {subvalue}")
+                    else:
+                        if isinstance(value, float):
+                            print(f"  {key}: {value:.2f}")
+                        else:
+                            print(f"  {key}: {value}")
 
         traci.close()
-        print("시뮬레이션 완료")
+        print("\n시뮬레이션 완료")
 
     except Exception as e:
         print(f"오류 발생: {e}")
