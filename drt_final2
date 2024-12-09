@@ -1,0 +1,584 @@
+import os
+import sys
+import traci
+import random
+from datetime import datetime, time
+from collections import defaultdict
+from itertools import permutations
+
+if 'SUMO_HOME' in os.environ:
+    tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
+    sys.path.append(tools)
+else:
+    sys.exit("SUMO_HOME 환경변수를 설정해주세요.")
+
+# 시스템 설정
+MAX_WAIT_TIME = 1200  # 최대 대기 시간 (20분)
+MAX_DETOUR_RATIO = 1.5  # 최대 우회 비율
+MIN_SHARING_DISTANCE = 2000  # 최소 합승 거리 (2km)
+BASE_FARE = 1500  # 기본 요금
+DISTANCE_FARE_UNIT = 100  # km당 추가 요금
+
+class OptimizedDRTVehicle:
+    def __init__(self, vehicle_id, capacity=15):
+        self.id = vehicle_id
+        self.capacity = capacity
+        self.current_occupancy = 0
+        self.status = "IDLE"  # IDLE, PICKUP, DROPOFF, RETURN
+        self.current_route = []
+        self.scheduled_stops = []
+        self.last_edge = None
+        self.total_distance = 0
+        self.occupied_distance = 0
+        self.current_passengers = set()
+        self.active = True
+
+    def can_accept_passengers(self, num_passengers, consider_scheduled=True):
+        if consider_scheduled:
+            max_occupancy = self.current_occupancy
+            for stop in self.scheduled_stops:
+                if stop["action"] == "PICKUP":
+                    max_occupancy += stop["passengers"]
+                elif stop["action"] == "DROPOFF":
+                    max_occupancy -= stop["passengers"]
+            return max_occupancy + num_passengers <= self.capacity
+        return self.current_occupancy + num_passengers <= self.capacity
+
+    def update_route(self, new_route):
+        self.current_route = new_route
+        return True
+
+class OptimizedDRTRequest:
+    def __init__(self, request_id, origin, destination, num_passengers):
+        self.id = request_id
+        self.origin = origin
+        self.destination = destination
+        self.num_passengers = num_passengers
+        self.status = "WAITING"
+        self.request_time = None
+        self.pickup_time = None
+        self.dropoff_time = None
+        self.assigned_vehicle = None
+        self.direct_distance = None
+        self.actual_distance = None
+        self.fare = None
+        self.shared_ride = False
+        self.max_wait_time = None
+        self.max_travel_time = None
+
+class OptimizedDRTSystem:
+    def __init__(self):
+        self.vehicles = {}
+        self.requests = {}
+        self.request_counter = 0
+        self.completed_requests = []
+        self.rejected_requests = []
+        self.waiting_requests = []
+        self.metrics = self.initialize_metrics()
+        self.time_windows = self.initialize_time_windows()
+
+    def initialize_metrics(self):
+        return {
+            "total_requests": 0,
+            "completed_requests": 0,
+            "rejected_requests": 0,
+            "shared_rides": 0,
+            "total_wait_time": 0,
+            "total_travel_time": 0,
+            "total_distance": 0,
+            "total_revenue": 0,
+            "vehicle_utilization": defaultdict(float),
+            "hourly_stats": defaultdict(lambda: {
+                "requests": 0,
+                "completed": 0,
+                "wait_time": 0,
+                "travel_time": 0,
+                "revenue": 0
+            })
+        }
+
+    def initialize_time_windows(self):
+        return {
+            "morning_peak": {"start": 7, "end": 9, "weight": 1.5},
+            "day_off_peak": {"start": 9, "end": 16, "weight": 0.8},
+            "evening_peak": {"start": 16, "end": 19, "weight": 1.3},
+            "night_off_peak": {"start": 19, "end": 22, "weight": 0.7}
+        }
+
+    def check_vehicle_existence(self, vehicle_id):
+        try:
+            traci.vehicle.getPosition(vehicle_id)
+            return True
+        except traci.exceptions.TraCIException:
+            return False
+
+    def add_vehicle(self, vehicle_id):
+        try:
+            if self.check_vehicle_existence(vehicle_id):
+                traci.vehicle.remove(vehicle_id)
+            
+            traci.vehicle.add(vehicle_id, "route_0", typeID="drt_vehicle")
+            vehicle = OptimizedDRTVehicle(vehicle_id)
+            self.vehicles[vehicle_id] = vehicle
+            print(f"차량 {vehicle_id} 추가됨")
+            return True
+        except traci.exceptions.TraCIException as e:
+            print(f"차량 추가 실패: {e}")
+            return False
+
+    def process_request(self, origin, destination, num_passengers):
+        request_id = f"req_{self.request_counter}"
+        self.request_counter += 1
+        
+        request = OptimizedDRTRequest(request_id, origin, destination, num_passengers)
+        request.request_time = traci.simulation.getTime()
+        
+        try:
+            route = traci.simulation.findRoute(origin, destination)
+            request.direct_distance = route.length
+            request.max_wait_time = min(MAX_WAIT_TIME, route.length / 10)
+            request.max_travel_time = route.travelTime * MAX_DETOUR_RATIO
+        except:
+            print(f"경로 계산 실패: {origin} -> {destination}")
+            return None
+
+        request.fare = self.calculate_fare(request)
+        self.requests[request_id] = request
+        self.metrics["total_requests"] += 1
+        
+        assigned_vehicle = self.find_best_vehicle(request)
+        if assigned_vehicle:
+            return request_id
+        else:
+            self.waiting_requests.append(request_id)
+            return request_id
+
+    def calculate_fare(self, request):
+        current_hour = int(traci.simulation.getTime() / 3600)
+        base_fare = BASE_FARE
+        distance_fare = max(0, (request.direct_distance - 10000) // 1000) * DISTANCE_FARE_UNIT
+        
+        time_multiplier = 1.0
+        for window in self.time_windows.values():
+            if window["start"] <= current_hour < window["end"]:
+                time_multiplier = window["weight"]
+                break
+        
+        demand_multiplier = 1.0
+        if len(self.waiting_requests) + len(self.requests) > 10:
+            demand_multiplier = 1.2
+        
+        return (base_fare + distance_fare) * time_multiplier * demand_multiplier
+
+    def find_best_vehicle(self, request):
+        best_vehicle = None
+        min_cost = float('inf')
+        
+        for vehicle_id, vehicle in self.vehicles.items():
+            if not vehicle.active or not vehicle.can_accept_passengers(request.num_passengers):
+                continue
+            
+            try:
+                current_edge = traci.vehicle.getRoadID(vehicle_id)
+                if current_edge == '':
+                    current_edge = vehicle.last_edge
+                    
+                if vehicle.status != "IDLE" and vehicle.current_passengers:
+                    cost = self.calculate_sharing_cost(vehicle, request)
+                    if cost < min_cost:
+                        min_cost = cost
+                        best_vehicle = vehicle_id
+                else:
+                    route = traci.simulation.findRoute(current_edge, request.origin)
+                    if route.edges:
+                        cost = route.length + route.travelTime
+                        if cost < min_cost:
+                            min_cost = cost
+                            best_vehicle = vehicle_id
+                            
+            except traci.exceptions.TraCIException:
+                continue
+        
+        if best_vehicle:
+            if self.assign_request_to_vehicle(best_vehicle, request.id):
+                return best_vehicle
+        
+        return None
+
+    def assign_request_to_vehicle(self, vehicle_id, request_id):
+        try:
+            vehicle = self.vehicles[vehicle_id]
+            request = self.requests[request_id]
+            
+            current_edge = traci.vehicle.getRoadID(vehicle_id)
+            if current_edge == '':
+                current_edge = vehicle.last_edge
+
+            pickup_route = traci.simulation.findRoute(current_edge, request.origin)
+            dropoff_route = traci.simulation.findRoute(request.origin, request.destination)
+            
+            if not pickup_route.edges or not dropoff_route.edges:
+                return False
+
+            vehicle.scheduled_stops.append({
+                "location": request.origin,
+                "action": "PICKUP",
+                "request_id": request_id,
+                "passengers": request.num_passengers,
+                "cost": pickup_route.length + pickup_route.travelTime
+            })
+            
+            vehicle.scheduled_stops.append({
+                "location": request.destination,
+                "action": "DROPOFF",
+                "request_id": request_id,
+                "passengers": request.num_passengers,
+                "cost": dropoff_route.length + dropoff_route.travelTime
+            })
+
+            request.assigned_vehicle = vehicle_id
+            request.status = "ASSIGNED"
+            vehicle.status = "PICKUP"
+            return True
+            
+        except Exception as e:
+            print(f"요청 할당 실패: {e}")
+            return False
+
+    def calculate_sharing_cost(self, vehicle, request):
+        try:
+            current_cost = sum(stop["cost"] for stop in vehicle.scheduled_stops)
+            
+            new_stops = vehicle.scheduled_stops.copy()
+            new_stops.append({
+                "location": request.origin,
+                "action": "PICKUP",
+                "request_id": request.id,
+                "passengers": request.num_passengers
+            })
+            new_stops.append({
+                "location": request.destination,
+                "action": "DROPOFF",
+                "request_id": request.id,
+                "passengers": request.num_passengers
+            })
+            
+            optimized_stops = self.optimize_route_order(vehicle, new_stops)
+            new_cost = sum(stop["cost"] for stop in optimized_stops)
+            delay_penalty = self.calculate_delay_penalty(vehicle, optimized_stops)
+            
+            return new_cost - current_cost + delay_penalty
+            
+        except Exception as e:
+            print(f"합승 비용 계산 실패: {e}")
+            return float('inf')
+
+    def optimize_route_order(self, vehicle, stops):
+        best_sequence = None
+        min_total_cost = float('inf')
+        
+        def is_valid_sequence(sequence):
+            current_occupancy = vehicle.current_occupancy
+            for stop in sequence:
+                if stop["action"] == "PICKUP":
+                    current_occupancy += stop["passengers"]
+                else:
+                    current_occupancy -= stop["passengers"]
+                if current_occupancy > vehicle.capacity:
+                    return False
+            return True
+        
+        for sequence in permutations(stops):
+            if not is_valid_sequence(sequence):
+                continue
+                
+            total_cost = 0
+            current_edge = vehicle.last_edge
+            
+            for stop in sequence:
+                route = traci.simulation.findRoute(current_edge, stop["location"])
+                if not route.edges:
+                    total_cost = float('inf')
+                    break
+                total_cost += route.length + route.travelTime
+                current_edge = stop["location"]
+            
+            if total_cost < min_total_cost:
+                min_total_cost = total_cost
+                best_sequence = sequence
+        
+        return list(best_sequence) if best_sequence else stops
+
+    def calculate_delay_penalty(self, vehicle, new_stops):
+        delay_penalty = 0
+        original_arrival_times = {}
+        
+        current_time = traci.simulation.getTime()
+        current_edge = vehicle.last_edge
+        
+        for stop in vehicle.scheduled_stops:
+            route = traci.simulation.findRoute(current_edge, stop["location"])
+            if route.edges:
+                current_time += route.travelTime
+                original_arrival_times[stop["request_id"]] = current_time
+                current_edge = stop["location"]
+        
+        current_time = traci.simulation.getTime()
+        current_edge = vehicle.last_edge
+        
+        for stop in new_stops:
+            route = traci.simulation.findRoute(current_edge, stop["location"])
+            if route.edges:
+                current_time += route.travelTime
+                if stop["request_id"] in original_arrival_times:
+                    delay = current_time - original_arrival_times[stop["request_id"]]
+                    if delay > 0:
+                        delay_penalty += delay
+                current_edge = stop["location"]
+        
+        return delay_penalty
+
+    def update(self):
+        current_time = traci.simulation.getTime()
+        
+        for vehicle_id, vehicle in self.vehicles.items():
+            if not vehicle.active:
+                continue
+                
+            try:
+                current_edge = traci.vehicle.getRoadID(vehicle_id)
+                if current_edge != '':
+                    vehicle.last_edge = current_edge
+                    
+                if vehicle.scheduled_stops:
+                    stop = vehicle.scheduled_stops[0]
+                    if current_edge == stop["location"]:
+                        self.handle_stop_arrival(vehicle_id, stop)
+                        vehicle.scheduled_stops.pop(0)
+
+                if vehicle.status != "IDLE":
+                    try:
+                        distance = traci.vehicle.getDistance(vehicle_id)
+                        vehicle.total_distance += distance
+                        if vehicle.current_occupancy > 0:
+                            vehicle.occupied_distance += distance
+                    except:
+                        pass
+                    
+            except traci.exceptions.TraCIException as e:
+                print(f"차량 업데이트 실패: {e}")
+                continue
+            
+        self.update_metrics()
+
+    def handle_stop_arrival(self, vehicle_id, stop):
+        """정차 처리"""
+        vehicle = self.vehicles[vehicle_id]
+        request = self.requests[stop["request_id"]]
+        
+        if stop["action"] == "PICKUP":
+            vehicle.current_occupancy += stop["passengers"]
+            request.status = "ONBOARD"
+            request.pickup_time = traci.simulation.getTime()
+            self.metrics["total_wait_time"] += (request.pickup_time - request.request_time)
+            print(f"차량 {vehicle_id}가 {stop['passengers']}명 승차 (현재 탑승: {vehicle.current_occupancy}명)")
+            
+            if len(vehicle.scheduled_stops) > 2:
+                request.shared_ride = True
+                self.metrics["shared_rides"] += 1
+        
+        elif stop["action"] == "DROPOFF":
+            vehicle.current_occupancy -= stop["passengers"]
+            request.status = "COMPLETED"
+            request.dropoff_time = traci.simulation.getTime()
+            self.metrics["total_travel_time"] += (request.dropoff_time - request.pickup_time)
+            self.metrics["completed_requests"] += 1
+            self.metrics["total_revenue"] += request.fare
+            self.completed_requests.append(request.id)
+            print(f"차량 {vehicle_id}가 승객 하차 완료 (현재 탑승: {vehicle.current_occupancy}명)")
+
+    def update_metrics(self):
+        current_time = traci.simulation.getTime()
+        current_hour = int(current_time / 3600)
+        
+        for request in self.requests.values():
+            if request.status == "COMPLETED":
+                stats = self.metrics["hourly_stats"][current_hour]
+                stats["completed"] += 1
+                stats["wait_time"] += (request.pickup_time - request.request_time)
+                stats["travel_time"] += (request.dropoff_time - request.pickup_time)
+                stats["revenue"] += request.fare
+        
+        for vehicle_id, vehicle in self.vehicles.items():
+            if vehicle.status != "IDLE":
+                self.metrics["vehicle_utilization"][vehicle_id] += 1
+
+    def get_hourly_statistics(self, hour):
+        stats = self.metrics["hourly_stats"][hour]
+        return {
+            "completed_requests": stats["completed"],
+            "avg_wait_time": stats["wait_time"] / max(stats["completed"], 1) / 60,
+            "vehicle_utilization": sum(self.metrics["vehicle_utilization"].values()) / len(self.vehicles) * 100,
+            "sharing_rate": self.metrics["shared_rides"] / max(stats["completed"], 1) * 100,
+            "revenue": stats["revenue"]
+        }
+
+    def get_detailed_statistics(self):
+        stats = {
+            "서비스 성과": {
+                "총 요청 수": self.metrics["total_requests"],
+                "완료된 요청": self.metrics["completed_requests"],
+                "거절된 요청": self.metrics["rejected_requests"],
+                "합승 횟수": self.metrics["shared_rides"],
+                "평균 대기 시간": self.metrics["total_wait_time"] / max(self.metrics["completed_requests"], 1),
+                "평균 이동 시간": self.metrics["total_travel_time"] / max(self.metrics["completed_requests"], 1)
+            },
+            "운영 효율성": {
+                "총 운행 거리": self.metrics["total_distance"],
+                "평균 차량 가동률": sum(self.metrics["vehicle_utilization"].values()) / len(self.vehicles) / 3600 * 100,
+                "총 수익": self.metrics["total_revenue"],
+                "km당 수익": self.metrics["total_revenue"] / max(self.metrics["total_distance"], 1)
+            },
+            "시간대별 통계": {
+                hour: {
+                    "완료 요청": stats["completed"],
+                    "평균 대기시간": stats["wait_time"] / max(stats["completed"], 1),
+                    "평균 이동시간": stats["travel_time"] / max(stats["completed"], 1),
+                    "수익": stats["revenue"]
+                } for hour, stats in self.metrics["hourly_stats"].items()
+            }
+        }
+        return stats
+
+def run_optimized_simulation():
+    sumo_binary = "sumo-gui"
+    sumo_cmd = [sumo_binary, "-c", "config/wonju.sumocfg"]
+
+    try:
+        traci.start(sumo_cmd)
+        print("최적화된 DRT 시뮬레이션 시작")
+
+        drt_system = OptimizedDRTSystem()
+
+        # 차량 초기화 (기본 3대 운영)
+        for i in range(3):
+            drt_system.add_vehicle(f"drt_{i}")
+
+        step = 0
+        next_request_time = random.randint(100, 300)
+
+        # 주요 정류장 정의 (실제 원주시 주요 지점)
+        stops = {
+            "부론면": "-1006685487",
+            "흥업면": "-1013458887",
+            "문막읍": "-1010175240",
+            "소초면": "-1060515905",
+            "호저면": "-1021870413"
+        }
+
+        # 시간대별 수요 패턴
+        time_demand_patterns = {
+            6: 0.3,   # 새벽
+            7: 1.0,   # 출근시간
+            8: 1.2,
+            9: 0.8,
+            10: 0.5,  # 오전
+            11: 0.6,
+            12: 0.9,  # 점심
+            13: 0.7,
+            14: 0.5,  # 오후
+            15: 0.6,
+            16: 1.0,  # 퇴근시간
+            17: 1.2,
+            18: 0.9,
+            19: 0.7,  # 저녁
+            20: 0.5,
+            21: 0.4   # 늦은 저녁
+        }
+
+        while step < 3600 * 16:  # 16시간 운영 (06:00 ~ 22:00)
+            traci.simulationStep()
+            current_hour = 6 + (step // 3600)
+            
+            if step >= next_request_time:
+                if random.random() < time_demand_patterns.get(current_hour, 0.5):
+                    # 출발지와 목적지 선택
+                    stop_names = list(stops.keys())
+                    origin_name = random.choice(stop_names)
+                    dest_name = random.choice([s for s in stop_names if s != origin_name])
+                    
+                    # 요청 생성
+                    num_passengers = random.randint(1, 4)
+                    request_id = drt_system.process_request(
+                        stops[origin_name],
+                        stops[dest_name],
+                        num_passengers
+                    )
+                    
+                    print(f"\n시간: {current_hour:02d}:00")
+                    print(f"새로운 요청: {origin_name} → {dest_name} ({num_passengers}명)")
+                
+                base_interval = random.randint(200, 500)
+                demand_factor = time_demand_patterns.get(current_hour, 0.5)
+                next_request_time = step + int(base_interval / demand_factor)
+            
+            drt_system.update()
+            
+            if step % 3600 == 0 and step > 0:
+                print(f"\n=== {current_hour:02d}:00 운영 현황 ===")
+                hourly_stats = drt_system.get_hourly_statistics(current_hour)
+                print_hourly_statistics(hourly_stats)
+            
+            step += 1
+
+        print("\n=== 시뮬레이션 최종 결과 ===")
+        final_stats = drt_system.get_detailed_statistics()
+        print_detailed_statistics(final_stats)
+
+        traci.close()
+        print("\n시뮬레이션 완료")
+
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        if 'traci' in sys.modules:
+            traci.close()
+
+def print_hourly_statistics(stats):
+    print(f"처리된 요청: {stats['completed_requests']}건")
+    print(f"평균 대기 시간: {stats['avg_wait_time']:.1f}분")
+    print(f"차량 가동률: {stats['vehicle_utilization']:.1f}%")
+    print(f"합승률: {stats['sharing_rate']:.1f}%")
+    print(f"수익: {stats['revenue']:,}원")
+
+def print_detailed_statistics(stats):
+    print("\n1. 서비스 성과")
+    for key, value in stats["서비스 성과"].items():
+        if isinstance(value, float):
+            print(f"{key}: {value:.1f}")
+        else:
+            print(f"{key}: {value}")
+
+    print("\n2. 운영 효율성")
+    for key, value in stats["운영 효율성"].items():
+        if isinstance(value, float):
+            print(f"{key}: {value:.1f}")
+        else:
+            print(f"{key}: {value:,}")
+
+    print("\n3. 시간대별 통계")
+    for hour, hour_stats in sorted(stats["시간대별 통계"].items()):
+        print(f"\n{hour:02d}:00 - {hour+1:02d}:00")
+        for key, value in hour_stats.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.1f}")
+            else:
+                print(f"  {key}: {value:,}")
+
+def main():
+    if 'SUMO_HOME' not in os.environ:
+        sys.exit("SUMO_HOME 환경변수를 설정해주세요.")
+    
+    run_optimized_simulation()
+
+if __name__ == "__main__":
+    main()
