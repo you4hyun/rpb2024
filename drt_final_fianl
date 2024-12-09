@@ -95,6 +95,23 @@ class DRTSystem:
         except traci.exceptions.TraCIException as e:
             print(f"차량 추가 실패: {e}")
 
+    def reset_vehicle(self, vehicle_id):
+        try:
+            if self.check_vehicle_existence(vehicle_id):
+                traci.vehicle.remove(vehicle_id)
+            
+            traci.vehicle.add(vehicle_id, "route_0", typeID="drt_vehicle")
+            traci.vehicle.setStop(vehicle_id, self.buron_base, duration=1)
+            traci.vehicle.setColor(vehicle_id, (255, 255, 255))
+            vehicle = self.vehicles[vehicle_id]
+            vehicle.status = "IDLE"
+            vehicle.current_occupancy = 0
+            vehicle.scheduled_stops = []
+            vehicle.last_edge = self.buron_base
+            print(f"차량 {vehicle_id} 재배치됨")
+        except traci.exceptions.TraCIException as e:
+            print(f"차량 재배치 실패: {e}")
+
     def check_vehicle_existence(self, vehicle_id):
         try:
             traci.vehicle.getPosition(vehicle_id)
