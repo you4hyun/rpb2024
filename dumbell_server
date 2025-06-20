@@ -1,0 +1,91 @@
+from flask import Flask, request, jsonify
+import cv2
+import numpy as np
+import mediapipe as mp
+import time
+
+app = Flask(__name__)
+
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+# 상태 변수
+right_curl_state = 'down'
+right_curl_count = 0
+squat_state = 'up'
+squat_count = 0
+
+def calculate_angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    ba = a - b
+    bc = c - b
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+    return np.degrees(angle)
+
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    global right_curl_count, right_curl_state, squat_count, squat_state
+
+    mode = request.form.get('mode', 'dumbbell')
+    file = request.files['frame']
+    npimg = np.frombuffer(file.read(), np.uint8)
+    frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        return jsonify({'error': 'Invalid image'}), 400
+
+    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose.process(image)
+
+    if not results.pose_landmarks:
+        return jsonify({'error': 'no pose detected'}), 400
+
+    h, w, _ = frame.shape
+    lm = results.pose_landmarks.landmark
+
+    if mode == 'dumbbell':
+        shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].x * w,
+                    lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].y * h]
+        elbow = [lm[mp_pose.PoseLandmark.RIGHT_ELBOW].x * w,
+                 lm[mp_pose.PoseLandmark.RIGHT_ELBOW].y * h]
+        wrist = [lm[mp_pose.PoseLandmark.RIGHT_WRIST].x * w,
+                 lm[mp_pose.PoseLandmark.RIGHT_WRIST].y * h]
+
+        angle = calculate_angle(shoulder, elbow, wrist)
+
+        if angle < 65:
+            right_curl_state = 'up'
+        elif right_curl_state == 'up' and angle > 140:
+            right_curl_count += 1
+            right_curl_state = 'down'
+
+        return jsonify({'mode': mode, 'angle': int(angle), 'count': right_curl_count})
+
+    elif mode == 'squat':
+        hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP].x * w,
+               lm[mp_pose.PoseLandmark.RIGHT_HIP].y * h]
+        knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE].x * w,
+                lm[mp_pose.PoseLandmark.RIGHT_KNEE].y * h]
+        ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE].x * w,
+                 lm[mp_pose.PoseLandmark.RIGHT_ANKLE].y * h]
+        shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].x * w,
+                    lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].y * h]
+        mid_torso = [(shoulder[0] + hip[0]) / 2,
+                     (shoulder[1] + hip[1]) / 2]
+
+        angle_knee = calculate_angle(hip, knee, ankle)
+        angle_hip = calculate_angle(mid_torso, hip, knee)
+
+        if angle_knee < 100 and angle_hip < 90:
+            squat_state = 'down'
+        elif squat_state == 'down' and angle_knee > 150 and angle_hip > 150:
+            squat_count += 1
+            squat_state = 'up'
+
+        return jsonify({'mode': mode, 'angle': int(angle_knee), 'count': squat_count})
+
+    return jsonify({'error': 'invalid mode'}), 400
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
